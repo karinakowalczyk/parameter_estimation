@@ -44,13 +44,15 @@ const DEFAULT_RUN_OUTPUT = "/p/tmp/karinako/default_run_long/0/ocn_ts.nc"
 ```
 
 ### Calibration Parameters
-6 ocean parameters with uniform priors:
+6 ocean parameters with **uniform priors** (true uniform distributions, not truncated Gaussians):
 - `diff_dia_min`: [7.5e-6, 1.25e-5]
 - `drag_topo_fac`: [2.25, 3.75]
 - `slope_max`: [7.5e-4, 1.25e-3]
 - `diff_iso`: [1125, 1875]
 - `diff_gm`: [1125, 1875]
 - `diff_dia_max`: [1.125e-4, 1.875e-4]
+
+**Note on priors**: While EKI updates use Gaussian-like covariance operations in unconstrained space, the initial ensemble is sampled from true uniform distributions in physical space, as specified by the bounds above.
 
 ### Observations
 7 target statistics from default run:
@@ -69,7 +71,6 @@ const DEFAULT_RUN_OUTPUT = "/p/tmp/karinako/default_run_long/0/ocn_ts.nc"
 - Walltime: 200 hours
 - CPUs: 32 (OpenMP threads)
 - Memory: 64 GB
-
 ## Usage
 
 ### Basic Run
@@ -210,4 +211,4 @@ using JLD2
 
 If using this code, please cite:
 - EnsembleKalmanProcesses.jl: https://github.com/CliMA/EnsembleKalmanProcesses.jl
-- CLIMBER-X: 
+- CLIMBER-X: [appropriate citation]

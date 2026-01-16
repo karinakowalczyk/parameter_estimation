@@ -6,6 +6,7 @@ using Random
 using JLD2
 using Dates
 using Printf
+using Distributions  # for Uniform distribution in priors
 
 # Include job management and summary statistics
 include("eks_job_management.jl")
@@ -388,17 +389,18 @@ function run_climber_x_calibration(;
         error("Insufficient disk space")
     end
     
-    # Setup prior - uniform distributions
+    # Setup prior - TRUE uniform distributions
     println("\nSetting up prior distributions...")
+    using Distributions  # for Uniform
+    
     prior_dists = []
     for name in PARAM_NAMES
         bounds = PRIOR_BOUNDS[name]
-        push!(prior_dists, 
-              constrained_gaussian(name, 
-                                  mean(bounds), 
-                                  (bounds[2] - bounds[1]) / 6,  # std ≈ range/6
-                                  bounds[1], 
-                                  bounds[2]))
+        # Create uniform distribution in physical space
+        uniform_dist = Parameterized(Uniform(bounds[1], bounds[2]))
+        # No constraint needed - distribution is already in physical space
+        constraint = no_constraint()
+        push!(prior_dists, ParameterDistribution(uniform_dist, constraint, name))
     end
     prior = combine_distributions(prior_dists)
     
