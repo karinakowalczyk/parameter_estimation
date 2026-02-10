@@ -51,16 +51,32 @@ const PRIOR_BOUNDS = Dict(
     "diff_gm" => (1100.0, 1900.0),
     "diff_dia_max" => (1.1e-4, 1.9e-4)
 )
-# Observation uncertainties (matching MCMC/ABC setup)
-const OBS_UNCERTAINTIES = [
-    0.18,   # PCA component 1 (same σ for all 5 components)
-    0.18,   # PCA component 2
-    0.18,   # PCA component 3
-    0.18,   # PCA component 4
-    0.18,   # PCA component 5
-    39.1,   # avg_waiting_time (years)
-    42.6    # avg_stadial_duration (years)
-]
+
+# PDF calibration settings
+const PDF_GRID_POINTS = 100
+const PDF_TOLERANCE = 0.03  # L2 distance tolerance for PDF (equivalent to ~0.01 supremum)
+
+# Dynamical statistics uncertainties (from your original setup)
+const WAITING_TIME_UNCERTAINTY = 39.1  # years
+const STADIAL_DURATION_UNCERTAINTY = 42.6  # years
+
+# ============================================
+# NORMALIZATION UTILITIES
+# ============================================
+
+"""
+Normalize observations by their uncertainties
+"""
+function normalize_observations(y, uncertainties)
+    return y ./ uncertainties
+end
+
+"""
+Denormalize observations back to physical units
+"""
+function denormalize_observations(y_normalized, uncertainties)
+    return y_normalized .* uncertainties
+end
 
 # ============================================
 # JOB SUBMISSION USING RUNME
@@ -227,15 +243,113 @@ function validate_climber_output_file(output_file; min_size_bytes=100000)
 end
 
 # ============================================
+# PDF AND STATISTICS COMPUTATION
+# ============================================
+
+"""
+Compute PDF on a common grid for consistent comparison
+"""
+function compute_pdf_on_grid(amoc_data, x_grid; remove_spinup=true, spinup_fraction=0.02)
+    amoc_data = vec(amoc_data)
+    
+    # Remove spinup
+    if remove_spinup
+        start_idx = Int(floor(length(amoc_data) * spinup_fraction)) + 1
+        amoc_data = amoc_data[start_idx:end]
+    end
+    
+    # Compute KDE
+    kde_obj = kde(amoc_data)
+    
+    # Evaluate on grid
+    pdf_vals = pdf(kde_obj, x_grid)
+    
+    # Normalize
+    integral = sum((pdf_vals[1:end-1] .+ pdf_vals[2:end]) .* diff(x_grid)) / 2
+    pdf_vals = pdf_vals ./ integral
+    
+    return pdf_vals
+end
+
+"""
+Compute L2 distance between two PDFs
+"""
+function l2_distance(pdf1, pdf2, dx)
+    # L2 norm: sqrt(∫(f1 - f2)² dx)
+    # Discrete approximation: sqrt(Σ(f1 - f2)² * dx)
+    diff = pdf1 .- pdf2
+    return sqrt(sum(diff.^2) * dx)
+end
+
+"""
+Read AMOC from CLIMBER-X output file
+"""
+function read_climber_amoc(output_file::String)
+    if !isfile(output_file)
+        error("Output file does not exist: $output_file")
+    end
+    
+    try
+        ds = NCDataset(output_file)
+        amoc = ds["amoc26N"][:]
+        time = ds["time"][:]
+        close(ds)
+        
+        return amoc, time
+    catch e
+        @error "Failed to read CLIMBER-X output: $output_file" exception=e
+        rethrow(e)
+    end
+end
+
+"""
+Process CLIMBER-X output and extract PDF + dynamical statistics
+Returns: [pdf_values..., avg_waiting_time, avg_stadial_duration]
+"""
+function process_climber_output_with_stats(output_file::String, pdf_grid; 
+                                          remove_spinup=true, spinup_fraction=0.02,
+                                          do_min_spacing=500, do_crossing_value=5.0)
+    # Read AMOC
+    amoc, time = read_climber_amoc(output_file)
+    
+    # Compute PDF on common grid
+    pdf_vals = compute_pdf_on_grid(amoc, pdf_grid, 
+                                   remove_spinup=remove_spinup, 
+                                   spinup_fraction=spinup_fraction)
+    
+    # Compute summary statistics (from your climber_summary_stats.jl)
+    stats = compute_summary_stats(amoc; 
+                                  time_data=time,
+                                  remove_spinup=remove_spinup,
+                                  spinup_fraction=spinup_fraction,
+                                  adaptive_threshold=true,
+                                  threshold_method="clustering",
+                                  grid_points=length(pdf_grid),
+                                  ignore_first_stadial=true,
+                                  loess_span=0.02,
+                                  do_min_spacing=do_min_spacing,
+                                  do_crossing_value=do_crossing_value)
+    
+    # Combine PDF + dynamical statistics
+    calibration_vector = vcat(
+        pdf_vals,                          # 100 values
+        stats["avg_waiting_time"],         # 1 value
+        stats["avg_stadial_duration"]      # 1 value
+    )
+    
+    return calibration_vector, stats
+end
+
+# ============================================
 # RESULT COLLECTION
 # ============================================
 
 """
-Collect results from CLIMBER-X iteration using PCA model
+Collect results from CLIMBER-X iteration using PDF + dynamical statistics
 """
-function collect_climber_iteration_results(job_trackers, pca_model, y_obs; max_failures_allowed=5)
+function collect_climber_iteration_results(job_trackers, pdf_grid, y_obs, uncertainties; max_failures_allowed=5)
     N_ensemble = length(job_trackers)
-    n_outputs = length(y_obs)
+    n_outputs = length(y_obs)  # PDF grid points + 2 dynamical stats
     G_ensemble = zeros(n_outputs, N_ensemble)
     
     n_failures = 0
@@ -248,13 +362,17 @@ function collect_climber_iteration_results(job_trackers, pca_model, y_obs; max_f
             
             if is_valid
                 try
-                    calibration_stats, full_stats = process_climber_output(
-                        tracker.output_file, pca_model,
-                        remove_spinup=true, spinup_fraction=0.02, do_min_spacing=500,
-                        do_crossing_value=2.0
+                    # Process output: get PDF + stats
+                    calibration_vector, stats = process_climber_output_with_stats(
+                        tracker.output_file, pdf_grid,
+                        remove_spinup=true, 
+                        spinup_fraction=0.02,
+                        do_min_spacing=500,
+                        do_crossing_value=5.0
                     )
                     
-                    G_ensemble[:, j] = calibration_stats
+                    # Normalize by uncertainties
+                    G_ensemble[:, j] = normalize_observations(calibration_vector, uncertainties)
                     
                     if j % 10 == 0
                         println("    Processed $j/$N_ensemble outputs")
@@ -286,13 +404,63 @@ function collect_climber_iteration_results(job_trackers, pca_model, y_obs; max_f
     
     println("  ✓ Results collected: $(N_ensemble - n_failures) successful")
     
+    # Compute and report statistics (denormalize for reporting)
+    valid_members = [j for j in 1:N_ensemble if !any(isnan.(G_ensemble[:, j]))]
+    if !isempty(valid_members)
+        n_pdf = length(pdf_grid)
+        dx = step(pdf_grid)
+        
+        # Denormalize for physical interpretation
+        G_denorm = zeros(n_outputs, length(valid_members))
+        for (idx, j) in enumerate(valid_members)
+            G_denorm[:, idx] = denormalize_observations(G_ensemble[:, j], uncertainties)
+        end
+        
+        y_obs_denorm = denormalize_observations(y_obs, uncertainties)
+        
+        # PDF L2 distances (in physical units)
+        pdf_obs = y_obs_denorm[1:n_pdf]
+        l2_distances = [l2_distance(G_denorm[1:n_pdf, idx], pdf_obs, dx) for idx in 1:length(valid_members)]
+        
+        # Waiting times (in physical units)
+        waiting_times = G_denorm[n_pdf+1, :]
+        waiting_time_obs = y_obs_denorm[n_pdf+1]
+        
+        # Stadial durations (in physical units)
+        stadial_durations = G_denorm[n_pdf+2, :]
+        stadial_duration_obs = y_obs_denorm[n_pdf+2]
+        
+        println("\n  PDF L2 distance statistics (physical units):")
+        println("    Mean: $(round(mean(l2_distances), digits=6))")
+        println("    Min:  $(round(minimum(l2_distances), digits=6))")
+        println("    Max:  $(round(maximum(l2_distances), digits=6))")
+        println("    Members within tolerance (< $PDF_TOLERANCE): $(sum(l2_distances .< PDF_TOLERANCE))/$(length(l2_distances))")
+        
+        println("\n  Waiting time statistics (years):")
+        println("    Target: $(round(waiting_time_obs, digits=1)) years")
+        println("    Mean:   $(round(mean(waiting_times), digits=1)) years")
+        println("    Std:    $(round(std(waiting_times), digits=1)) years")
+        println("    Range:  [$(round(minimum(waiting_times), digits=1)), $(round(maximum(waiting_times), digits=1))] years")
+        
+        println("\n  Stadial duration statistics (years):")
+        println("    Target: $(round(stadial_duration_obs, digits=1)) years")
+        println("    Mean:   $(round(mean(stadial_durations), digits=1)) years")
+        println("    Std:    $(round(std(stadial_durations), digits=1)) years")
+        println("    Range:  [$(round(minimum(stadial_durations), digits=1)), $(round(maximum(stadial_durations), digits=1))] years")
+        
+        println("\n  Normalized observation statistics (for EKI):")
+        println("    PDF components: $(round(mean(G_ensemble[1:n_pdf, valid_members]), digits=3)) ± $(round(std(G_ensemble[1:n_pdf, valid_members]), digits=3))")
+        println("    Waiting time: $(round(mean(G_ensemble[n_pdf+1, valid_members]), digits=3)) ± $(round(std(G_ensemble[n_pdf+1, valid_members]), digits=3))")
+        println("    Stadial duration: $(round(mean(G_ensemble[n_pdf+2, valid_members]), digits=3)) ± $(round(std(G_ensemble[n_pdf+2, valid_members]), digits=3))")
+    end
+    
     return G_ensemble
 end
 
 """
 Collect results from existing output files (for resuming)
 """
-function collect_results_from_files(output_dir, iteration, N_ensemble, pca_model, y_obs; max_failures_allowed=5)
+function collect_results_from_files(output_dir, iteration, N_ensemble, pdf_grid, y_obs, uncertainties; max_failures_allowed=5)
     n_outputs = length(y_obs)
     G_ensemble = zeros(n_outputs, N_ensemble)
     n_failures = 0
@@ -305,12 +473,14 @@ function collect_results_from_files(output_dir, iteration, N_ensemble, pca_model
         
         if is_valid
             try
-                calibration_stats, _ = process_climber_output(
-                    output_file, pca_model,
-                    remove_spinup=true, spinup_fraction=0.02, do_min_spacing=500, 
-                    do_crossing_value = 2.0
+                calibration_vector, _ = process_climber_output_with_stats(
+                    output_file, pdf_grid,
+                    remove_spinup=true, 
+                    spinup_fraction=0.02,
+                    do_min_spacing=500,
+                    do_crossing_value=5.0
                 )
-                G_ensemble[:, j] = calibration_stats
+                G_ensemble[:, j] = normalize_observations(calibration_vector, uncertainties)
                 
                 if j % 10 == 0
                     println("    Processed $j/$N_ensemble outputs")
@@ -336,57 +506,77 @@ function collect_results_from_files(output_dir, iteration, N_ensemble, pca_model
 end
 
 # ============================================
-# PCA MODEL MANAGEMENT
+# CHECKPOINT MANAGEMENT
 # ============================================
 
 """
-Load or fit PCA model
+Save checkpoint
 """
-function load_or_fit_pca(output_dir, ensemble_files, pca_components)
-    pca_file = joinpath(output_dir, "pca_model.jld2")
+function save_checkpoint(iteration, eksobj, prior, param_history, 
+                        y_obs, obs_noise_cov, pdf_grid, uncertainties, metadata, checkpoint_dir)
+    checkpoint_file = joinpath(checkpoint_dir, "checkpoint_iter_$(iteration).jld2")
     
-    if isfile(pca_file)
-        println("\n  Loading existing PCA model from $pca_file")
-        @load pca_file pca_model y_obs
-        println("  ✓ PCA model loaded")
-        println("  Target observations:")
-        println("    PCA components: $(round.(y_obs[1:5], digits=4))")
-        println("    Avg waiting time: $(round(y_obs[6], digits=1)) years")
-        println("    Avg stadial duration: $(round(y_obs[7], digits=1)) years")
-        return pca_model, y_obs
-    else
-        println("\n  Fitting new PCA model...")
-        
-        if length(ensemble_files) < 5
-            error("Cannot fit PCA with only $(length(ensemble_files)) successful runs. Need at least 5.")
+    checkpoint_data = Dict(
+        "iteration" => iteration,
+        "eksobj" => eksobj,
+        "prior" => prior,
+        "param_history" => param_history,
+        "y_obs" => y_obs,
+        "obs_noise_cov" => obs_noise_cov,
+        "pdf_grid" => pdf_grid,
+        "uncertainties" => uncertainties,
+        "metadata" => metadata
+    )
+    
+    @save checkpoint_file checkpoint_data
+    println("  ✓ Checkpoint saved: $checkpoint_file")
+end
+
+"""
+Save iteration results with L2 distances and statistics
+"""
+function save_iteration_results(iteration, params_i, G_ensemble, 
+                               current_mean, current_std, y_obs, pdf_grid, uncertainties, output_dir)
+    results_file = joinpath(output_dir, "iteration_$(iteration)_results.jld2")
+    
+    # Compute diagnostics for all valid members (in physical units)
+    dx = step(pdf_grid)
+    n_pdf = length(pdf_grid)
+    
+    l2_distances = Float64[]
+    waiting_times = Float64[]
+    stadial_durations = Float64[]
+    
+    y_obs_denorm = denormalize_observations(y_obs, uncertainties)
+    
+    for j in 1:size(G_ensemble, 2)
+        if !any(isnan.(G_ensemble[:, j]))
+            G_denorm = denormalize_observations(G_ensemble[:, j], uncertainties)
+            push!(l2_distances, l2_distance(G_denorm[1:n_pdf], y_obs_denorm[1:n_pdf], dx))
+            push!(waiting_times, G_denorm[n_pdf+1])
+            push!(stadial_durations, G_denorm[n_pdf+2])
+        else
+            push!(l2_distances, NaN)
+            push!(waiting_times, NaN)
+            push!(stadial_durations, NaN)
         end
-        
-        pca_model, stats_default = initialize_pca_model(
-            DEFAULT_RUN_OUTPUT,
-            ensemble_files;
-            n_components=pca_components,
-            remove_spinup=true,
-            spinup_fraction=0.02
-        )
-        
-        # Extract target observations from default run
-        default_calibration_stats, _ = process_climber_output(
-            DEFAULT_RUN_OUTPUT, pca_model,
-            remove_spinup=true, spinup_fraction=0.02,
-        )
-        y_obs = default_calibration_stats
-        
-        println("\n  Target observations (from default run):")
-        println("    PCA components: $(round.(y_obs[1:5], digits=4))")
-        println("    Avg waiting time: $(round(y_obs[6], digits=1)) years")
-        println("    Avg stadial duration: $(round(y_obs[7], digits=1)) years")
-        
-        # Save PCA model for future use
-        @save pca_file pca_model y_obs
-        println("  ✓ PCA model saved to $pca_file")
-        
-        return pca_model, y_obs
     end
+    
+    @save results_file params_i G_ensemble current_mean current_std l2_distances waiting_times stadial_durations uncertainties
+    
+    println("  ✓ Iteration results saved: $results_file")
+end
+
+"""
+Save final results
+"""
+function save_final_results(θ_optimal, θ_std, final_ensemble, 
+                          y_obs, pdf_grid, uncertainties, metadata, output_dir)
+    final_file = joinpath(output_dir, "final_results.jld2")
+    
+    @save final_file θ_optimal θ_std final_ensemble y_obs pdf_grid uncertainties metadata
+    
+    println("  ✓ Final results saved: $final_file")
 end
 
 # ============================================
@@ -400,14 +590,17 @@ function run_climber_x_calibration(;
     work_dir="/p/tmp/karinako/eki_calibration/working",
     check_interval_minutes=30,
     max_wait_days=10,
-    pca_components=5,
-    )
+    pdf_grid_points=100)
     
     println("="^80)
-    println("CLIMBER-X EKI CALIBRATION")
+    println("CLIMBER-X EKI CALIBRATION - PDF + DYNAMICAL STATISTICS (NORMALIZED)")
     println("="^80)
     println("Parameters: $(length(PARAM_NAMES)) ocean parameters")
-    println("Observations: $pca_components PCA components + 2 dynamical statistics")
+    println("Observations:")
+    println("  - PDF with $pdf_grid_points grid points (L2 tolerance: $PDF_TOLERANCE)")
+    println("  - Average waiting time (σ = $WAITING_TIME_UNCERTAINTY years)")
+    println("  - Average stadial duration (σ = $STADIAL_DURATION_UNCERTAINTY years)")
+    println("  - All observations normalized by uncertainties for balanced fitting")
     println("Ensemble size: $N_ensemble")
     println("Iterations: $N_iterations")
     println("Output directory: $output_dir")
@@ -441,32 +634,37 @@ function run_climber_x_calibration(;
         error("Insufficient disk space")
     end
     
-    # Setup prior
     println("\nSetting up prior distributions...")
 
+    # Create parameter distributions - CORRECTED VERSION
     prior_dists = ParameterDistribution[]
+
     for name in PARAM_NAMES
         bounds = PRIOR_BOUNDS[name]
+        lower = bounds[1]
+        upper = bounds[2]
         
-        # Create uniform distribution using the built-in constructor
-        # For uniform distribution in constrained space, use Parameterized with Uniform
-        # and apply the bounded constraint
-        dist = Parameterized(Uniform(bounds[1], bounds[2]))
-        constraint = bounded(bounds[1], bounds[2])
-        
-        push!(prior_dists, 
-            ParameterDistribution(dist, constraint, name))
+        # Use Parameterized with Uniform (NO additional constraint needed)
+        dist = Parameterized(Uniform(lower, upper))
+        push!(prior_dists, ParameterDistribution(dist, no_constraint(), name))
     end
+
     prior = combine_distributions(prior_dists)
 
-    println("Prior configured for $(length(PARAM_NAMES)) parameters with uniform distributions")
+    # Add diagnostic
+    println("\n  Verifying prior samples:")
+    test_ensemble = construct_initial_ensemble(prior, 5)
+    for (idx, name) in enumerate(PARAM_NAMES)
+        println("    $(name): $(test_ensemble[idx, :])")
+    end
     
     # Check for existing checkpoint to resume from
     start_iteration = 1
     eksobj = nothing
-    pca_model = nothing
     y_obs = nothing
+    pdf_grid = nothing
     param_history = nothing
+    uncertainties = nothing
     
     # Find latest checkpoint
     existing_checkpoints = filter(f -> startswith(f, "checkpoint_iter_") && endswith(f, ".jld2"), 
@@ -491,12 +689,8 @@ function run_climber_x_calibration(;
                 prior = checkpoint_data["prior"]
                 param_history = checkpoint_data["param_history"]
                 y_obs = checkpoint_data["y_obs"]
-                
-                # Load PCA model
-                pca_file = joinpath(output_dir, "pca_model.jld2")
-                if isfile(pca_file)
-                    @load pca_file pca_model
-                end
+                pdf_grid = checkpoint_data["pdf_grid"]
+                uncertainties = checkpoint_data["uncertainties"]
                 
                 start_iteration = latest_iter + 1
                 println("  ✓ Resuming from iteration $start_iteration")
@@ -514,34 +708,112 @@ function run_climber_x_calibration(;
             error("Default run output not found: $DEFAULT_RUN_OUTPUT")
         end
         
+        # Read default run
         amoc_default, time_default = read_climber_amoc(DEFAULT_RUN_OUTPUT)
-        default_stats = compute_summary_stats(amoc_default; 
+        
+        # Remove spinup
+        start_idx = Int(floor(length(amoc_default) * 0.02)) + 1
+        amoc_default = amoc_default[start_idx:end]
+        time_default = time_default[start_idx:end]
+        
+        # Create common grid spanning reasonable AMOC range
+        x_min = minimum(amoc_default) - 2.0
+        x_max = maximum(amoc_default) + 2.0
+        pdf_grid = range(x_min, x_max, length=pdf_grid_points)
+        
+        # Compute default PDF on this grid
+        pdf_obs = compute_pdf_on_grid(amoc_default, pdf_grid, remove_spinup=false)
+        
+        # Compute dynamical statistics from default run
+        stats_default = compute_summary_stats(amoc_default; 
                                              time_data=time_default,
-                                             remove_spinup=true,
-                                             spinup_fraction=0.02)
+                                             remove_spinup=false,
+                                             spinup_fraction=0.0,
+                                             adaptive_threshold=true,
+                                             threshold_method="clustering",
+                                             loess_span=0.02,
+                                             do_min_spacing=500,
+                                             do_crossing_value=5.0)
         
-        println("  Default run statistics:")
-        println("    N stadials: $(default_stats["n_stadials"])")
-        println("    Avg stadial duration: $(round(default_stats["avg_stadial_duration"], digits=1)) years")
-        println("    N DO events: $(default_stats["n_do_events"])")
-        println("    Avg waiting time: $(round(default_stats["avg_waiting_time"], digits=1)) years")
+        # Create raw observation vector
+        y_obs_raw = vcat(
+            pdf_obs,                                    # 100 values
+            stats_default["avg_waiting_time"],          # 1 value
+            stats_default["avg_stadial_duration"]       # 1 value
+        )
         
-        # Initialize EKI with placeholder observations (will update after PCA)
-        obs_noise_cov = Diagonal(OBS_UNCERTAINTIES.^2)
+        dx = step(pdf_grid)
+        
+        # Create uncertainty vector
+        pdf_obs_uncertainty = PDF_TOLERANCE / sqrt(pdf_grid_points * dx)
+        uncertainties = vcat(
+            fill(pdf_obs_uncertainty, pdf_grid_points),
+            WAITING_TIME_UNCERTAINTY,
+            STADIAL_DURATION_UNCERTAINTY
+        )
+        
+        # Normalize observations by uncertainties
+        y_obs = normalize_observations(y_obs_raw, uncertainties)
+        
+        println("  PDF grid: $(length(pdf_grid)) points from $(round(x_min, digits=2)) to $(round(x_max, digits=2))")
+        println("  Grid spacing (dx): $(round(dx, digits=4))")
+        println("\n  Target observations (physical units):")
+        println("    PDF max: $(round(maximum(pdf_obs), digits=4))")
+        println("    PDF integral: $(round(sum((pdf_obs[1:end-1] .+ pdf_obs[2:end]) .* diff(pdf_grid))/2, digits=4))")
+        println("    Avg waiting time: $(round(stats_default["avg_waiting_time"], digits=1)) years")
+        println("    Avg stadial duration: $(round(stats_default["avg_stadial_duration"], digits=1)) years")
+        println("    N DO events: $(stats_default["n_do_events"])")
+        println("    N stadials: $(stats_default["n_stadials"])")
+        
+        println("\n  Target observations (normalized):")
+        println("    PDF range: [$(round(minimum(y_obs[1:pdf_grid_points]), digits=3)), $(round(maximum(y_obs[1:pdf_grid_points]), digits=3))]")
+        println("    Waiting time: $(round(y_obs[pdf_grid_points+1], digits=3))")
+        println("    Stadial duration: $(round(y_obs[pdf_grid_points+2], digits=3))")
+        
+        println("\n  Observation uncertainties:")
+        println("    PDF (per grid point): $(round(pdf_obs_uncertainty, digits=6))")
+        println("    Waiting time: $(WAITING_TIME_UNCERTAINTY) years")
+        println("    Stadial duration: $(STADIAL_DURATION_UNCERTAINTY) years")
+        
+        # Use unit observation covariance (since observations are normalized)
+        obs_noise_cov = Diagonal(ones(length(y_obs)))
+        
+        println("\n  Using unit observation covariance (normalized observations)")
         
         println("\nInitializing EKI process...")
         initial_ensemble = construct_initial_ensemble(prior, N_ensemble)
         eks_process = Sampler(prior)
-        
-        y_obs_placeholder = zeros(7)
+
+        println("\n  DEBUG: Initial ensemble after construction:")
+        for j in 1:min(3, N_ensemble)
+            println("  Member $j:")
+            for (idx, name) in enumerate(PARAM_NAMES)
+                println("    $(name): $(initial_ensemble[idx, j])")
+            end
+        end
         
         eksobj = EnsembleKalmanProcess(
             initial_ensemble,
-            y_obs_placeholder,
+            y_obs,
             obs_noise_cov,
             eks_process,
             verbose=true
         )
+
+        # DEBUG: Verify the ensemble after EKI initialization
+        params_after_init = get_ϕ_final(prior, eksobj)
+        println("\n  DEBUG: Ensemble after EKI initialization:")
+        for j in 1:min(3, N_ensemble)
+            println("  Member $j:")
+            for (idx, name) in enumerate(PARAM_NAMES)
+                println("    $(name): $(params_after_init[idx, j])")
+            end
+        end
+        # Check if they match
+        println("\n  DEBUG: Comparing initial_ensemble vs get_ϕ_final:")
+        for j in 1:min(3, N_ensemble)
+            println("  Member $j max difference: $(maximum(abs.(initial_ensemble[:, j] .- params_after_init[:, j])))")
+        end
         
         param_history = zeros(length(PARAM_NAMES), N_iterations + 1, N_ensemble)
         param_history[:, 1, :] = get_ϕ_final(prior, eksobj)
@@ -551,23 +823,35 @@ function run_climber_x_calibration(;
             "N_iterations" => N_iterations,
             "N_ensemble" => N_ensemble,
             "param_names" => PARAM_NAMES,
-            "obs_uncertainties" => OBS_UNCERTAINTIES,
+            "pdf_grid_points" => pdf_grid_points,
+            "pdf_tolerance" => PDF_TOLERANCE,
+            "waiting_time_uncertainty" => WAITING_TIME_UNCERTAINTY,
+            "stadial_duration_uncertainty" => STADIAL_DURATION_UNCERTAINTY,
             "default_run" => DEFAULT_RUN_OUTPUT,
+            "distance_metric" => "L2",
+            "observations" => "PDF + waiting_time + stadial_duration (normalized)",
+            "normalization" => "by_uncertainty"
         )
         
         save_checkpoint(0, eksobj, prior, param_history, 
-                       y_obs_placeholder, obs_noise_cov, metadata, checkpoint_dir)
+                       y_obs, obs_noise_cov, pdf_grid, uncertainties, metadata, checkpoint_dir)
     end
     
-    obs_noise_cov = Diagonal(OBS_UNCERTAINTIES.^2)
+    obs_noise_cov = Diagonal(ones(length(y_obs)))
     
     metadata = Dict(
         "start_time" => now(),
         "N_iterations" => N_iterations,
         "N_ensemble" => N_ensemble,
         "param_names" => PARAM_NAMES,
-        "obs_uncertainties" => OBS_UNCERTAINTIES,
+        "pdf_grid_points" => pdf_grid_points,
+        "pdf_tolerance" => PDF_TOLERANCE,
+        "waiting_time_uncertainty" => WAITING_TIME_UNCERTAINTY,
+        "stadial_duration_uncertainty" => STADIAL_DURATION_UNCERTAINTY,
         "default_run" => DEFAULT_RUN_OUTPUT,
+        "distance_metric" => "L2",
+        "observations" => "PDF + waiting_time + stadial_duration (normalized)",
+        "normalization" => "by_uncertainty"
     )
     
     # Main iteration loop
@@ -579,6 +863,16 @@ function run_climber_x_calibration(;
         println("="^80)
         
         params_i = get_ϕ_final(prior, eksobj)
+
+        # Right after: params_i = get_ϕ_final(prior, eksobj)
+
+        println("\n  DEBUG: First 3 ensemble members:")
+        for j in 1:min(3, size(params_i, 2))
+            println("  Member $j:")
+            for (idx, name) in enumerate(PARAM_NAMES)
+                println("    $(name): $(params_i[idx, j])")
+            end
+        end
         
         # Check if iteration already has completed outputs
         iter_dir = joinpath(output_dir, "iter_$(i)")
@@ -626,29 +920,8 @@ function run_climber_x_calibration(;
             end
         end
         
-        # After first iteration: load or fit PCA
-        if i == 1 && isnothing(pca_model)
-            # Collect output files that completed successfully
-            ensemble_files = [tracker.output_file for tracker in job_trackers 
-                            if tracker.status == :completed && 
-                               validate_climber_output_file(tracker.output_file)[1]]
-            
-            # Load or fit PCA model
-            pca_model, y_obs = load_or_fit_pca(output_dir, ensemble_files, pca_components)
-            
-            # Recreate EKI with correct observations
-            eks_process = Sampler(prior)
-            eksobj = EnsembleKalmanProcess(
-                get_ϕ(prior, eksobj, 1),  # FIXED: added prior argument
-                y_obs,
-                obs_noise_cov,
-                eks_process,
-                verbose=true
-            )
-        end
-        
-        # Collect results
-        G_ensemble = collect_climber_iteration_results(job_trackers, pca_model, y_obs, 
+        # Collect results (returns normalized G_ensemble)
+        G_ensemble = collect_climber_iteration_results(job_trackers, pdf_grid, y_obs, uncertainties,
                                                        max_failures_allowed=5)
         
         # Update ensemble
@@ -672,10 +945,10 @@ function run_climber_x_calibration(;
         
         # Save results
         save_iteration_results(i, params_i, G_ensemble, 
-                             current_mean, current_std, output_dir)
+                             current_mean, current_std, y_obs, pdf_grid, uncertainties, output_dir)
         
         save_checkpoint(i, eksobj, prior, param_history,
-                       y_obs, obs_noise_cov, metadata, checkpoint_dir)
+                       y_obs, obs_noise_cov, pdf_grid, uncertainties, metadata, checkpoint_dir)
     end
     
     # Final results
@@ -684,7 +957,7 @@ function run_climber_x_calibration(;
     θ_std = std(final_ensemble, dims=2)
     
     save_final_results(θ_optimal, vec(θ_std), final_ensemble,
-                      y_obs, metadata, output_dir)
+                      y_obs, pdf_grid, uncertainties, metadata, output_dir)
     
     println("\n" * "="^80)
     println("CLIMBER-X CALIBRATION COMPLETE!")
@@ -701,19 +974,74 @@ function run_climber_x_calibration(;
     end
     println("-"^80)
     
-    return eksobj, param_history, metadata, pca_model
+    # Compute final statistics
+    valid_members = []
+    final_pdfs = []
+    final_waiting_times = []
+    final_stadial_durations = []
+    
+    n_pdf = length(pdf_grid)
+    
+    for j in 1:N_ensemble
+        output_file = joinpath(output_dir, "iter_$(N_iterations)", "member_$(j)", "ocn_ts.nc")
+        if isfile(output_file) && validate_climber_output_file(output_file)[1]
+            try
+                calibration_vector, _ = process_climber_output_with_stats(
+                    output_file, pdf_grid,
+                    remove_spinup=true, 
+                    spinup_fraction=0.02,
+                    do_min_spacing=500,
+                    do_crossing_value=5.0
+                )
+                push!(valid_members, j)
+                push!(final_pdfs, calibration_vector[1:n_pdf])
+                push!(final_waiting_times, calibration_vector[n_pdf+1])
+                push!(final_stadial_durations, calibration_vector[n_pdf+2])
+            catch e
+                @warn "Could not process final member $j"
+            end
+        end
+    end
+    
+    if !isempty(final_pdfs)
+        dx = step(pdf_grid)
+        y_obs_denorm = denormalize_observations(y_obs, uncertainties)
+        pdf_obs = y_obs_denorm[1:n_pdf]
+        
+        l2_distances = [l2_distance(pdf, pdf_obs, dx) for pdf in final_pdfs]
+        
+        println("\nFinal PDF matching performance:")
+        println("  L2 distance - Mean: $(round(mean(l2_distances), digits=6))")
+        println("  L2 distance - Min:  $(round(minimum(l2_distances), digits=6))")
+        println("  L2 distance - Max:  $(round(maximum(l2_distances), digits=6))")
+        println("  Members within tolerance (< $PDF_TOLERANCE): $(sum(l2_distances .< PDF_TOLERANCE))/$(length(l2_distances))")
+        
+        println("\nFinal waiting time performance:")
+        println("  Target: $(round(y_obs_denorm[n_pdf+1], digits=1)) years")
+        println("  Mean:   $(round(mean(final_waiting_times), digits=1)) years")
+        println("  Std:    $(round(std(final_waiting_times), digits=1)) years")
+        println("  Range:  [$(round(minimum(final_waiting_times), digits=1)), $(round(maximum(final_waiting_times), digits=1))] years")
+        
+        println("\nFinal stadial duration performance:")
+        println("  Target: $(round(y_obs_denorm[n_pdf+2], digits=1)) years")
+        println("  Mean:   $(round(mean(final_stadial_durations), digits=1)) years")
+        println("  Std:    $(round(std(final_stadial_durations), digits=1)) years")
+        println("  Range:  [$(round(minimum(final_stadial_durations), digits=1)), $(round(maximum(final_stadial_durations), digits=1))] years")
+    end
+    
+    return eksobj, param_history, metadata, pdf_grid, uncertainties
 end
 
 # ============================================
 # RUN THE CALIBRATION
 # ============================================
 
-eksobj, param_history, metadata, pca_model = run_climber_x_calibration(
+eksobj, param_history, metadata, pdf_grid, uncertainties = run_climber_x_calibration(
     N_iterations=6,
     N_ensemble=60,
     output_dir="/p/tmp/karinako/eki_calibration_7000/output",
     work_dir="/p/tmp/karinako/eki_calibration_7000/working",
     check_interval_minutes=30,
     max_wait_days=10,
-    pca_components=5,
+    pdf_grid_points=100
 )
