@@ -6,7 +6,8 @@ using Random
 using JLD2
 using Dates
 using Printf
-using Distributions  # for Uniform distribution in priors
+using NCDatasets
+using Distributions
 
 # Include job management and summary statistics
 include("eks_job_management.jl")
@@ -22,12 +23,13 @@ const DEFAULT_RUN_OUTPUT = "/p/tmp/karinako/default_run_long/0/ocn_ts.nc"
 
 # Fixed CLIMBER-X parameters
 const CLIMBER_FIXED_PARAMS = Dict(
-    "ctl.nyears" => 75000,
+    "ctl.nyears" => 7000,
     "ctl.co2_const" => 190,
     "ctl.fake_geo_const_file" => "input/geo_ice_tarasov_12ka.nc",
     "ctl.fake_ice_const_file" => "input/geo_ice_tarasov_12ka.nc",
     "ctl.restart_in_dir" => "/home/karinako/climber-x/output/DO/spinup_ensemble/CO2_190/restart_out/year_3000",
-    "ocn.l_noise_fw" => "T"
+    "ocn.l_noise_fw" => "T",
+    "ocn.noise_amp_fw" => 0.4
 )
 
 # Calibration parameters (to be varied)
@@ -42,165 +44,150 @@ const PARAM_NAMES = [
 
 # Prior bounds (uniform distributions)
 const PRIOR_BOUNDS = Dict(
-    "diff_dia_min" => (7.5e-6, 1.25e-5),
-    "drag_topo_fac" => (2.25, 3.75),
-    "slope_max" => (7.5e-4, 1.25e-3),
-    "diff_iso" => (1125.0, 1875.0),
-    "diff_gm" => (1125.0, 1875.0),
-    "diff_dia_max" => (1.125e-4, 1.875e-4)
+    "diff_dia_min" => (6e-6, 1.4e-5),
+    "drag_topo_fac" => (2.6, 3.4),
+    "slope_max" => (6e-4, 1.4e-3),
+    "diff_iso" => (1100.0, 1900.0),
+    "diff_gm" => (1100.0, 1900.0),
+    "diff_dia_max" => (1.1e-4, 1.9e-4)
 )
-
-# Observation uncertainties
+# Observation uncertainties (matching MCMC/ABC setup)
 const OBS_UNCERTAINTIES = [
-    0.0189,  # PCA component 1
-    0.0189,  # PCA component 2
-    0.0189,  # PCA component 3
-    0.0189,  # PCA component 4
-    0.0189,  # PCA component 5
-    39.1,    # avg_waiting_time (years)
-    42.6     # avg_stadial_duration (years)
+    0.18,   # PCA component 1 (same σ for all 5 components)
+    0.18,   # PCA component 2
+    0.18,   # PCA component 3
+    0.18,   # PCA component 4
+    0.18,   # PCA component 5
+    39.1,   # avg_waiting_time (years)
+    42.6    # avg_stadial_duration (years)
 ]
 
 # ============================================
-# PARAMETER FILE WRITING
+# JOB SUBMISSION USING RUNME
 # ============================================
 
 """
-Write ensemble parameters to file in CLIMBER-X format
-Format:
-  Line 1: parameter names (with ocn. prefix)
-  Line 2+: parameter values for each ensemble member
+Submit a CLIMBER-X job using runme -s (submit mode)
+Returns the job ID and expected output file path
 """
-function write_climber_params_for_iteration(params_i, iteration, work_dir)
-    param_file = joinpath(work_dir, "iter_$(iteration)", "params_ensemble.txt")
-    mkpath(dirname(param_file))
-    
-    # Add ocn. prefix to parameter names
-    param_names_with_prefix = ["ocn." * name for name in PARAM_NAMES]
-    
-    N_ensemble = size(params_i, 2)
-    
-    open(param_file, "w") do f
-        # Write header with parameter names
-        println(f, join(param_names_with_prefix, " "))
-        
-        # Write each ensemble member as a row
-        for j in 1:N_ensemble
-            println(f, join([@sprintf("%.17g", val) for val in params_i[:, j]], " "))
-        end
-    end
-    
-    println("  ✓ Wrote parameter file: $param_file")
-    return param_file
-end
-
-# ============================================
-# CLIMBER-X JOB SCRIPT CREATION
-# ============================================
-
-"""
-Create SLURM job script for one CLIMBER-X ensemble member
-"""
-function create_climber_job_script(iteration, member_id, param_file, output_dir, work_dir)
+function submit_climber_job_with_runme(iteration, member_id, params_dict, output_dir, work_dir; 
+                                       walltime="20:00:00", qos="standby", omp=32)
     # Output directory for this member
     member_output_dir = joinpath(output_dir, "iter_$(iteration)", "member_$(member_id)")
-    mkpath(member_output_dir)
     
     # Expected output file
     output_file = joinpath(member_output_dir, "ocn_ts.nc")
     
-    # Job script file
-    script_file = joinpath(work_dir, "iter_$(iteration)", "member_$(member_id)_job.sh")
+    # Change to CLIMBER-X directory to run runme
+    original_dir = pwd()
+    cd(CLIMBER_X_DIR)
     
-    # Extract parameters for this member from combined file
-    # This will be done by reading line (member_id + 1) from param_file
+    try
+        # Build parameter string exactly like the bash script
+        param_str = ""
+        for (key, val) in params_dict
+            param_str *= " $(key)=$(val)"
+        end
+        
+        # Construct the full command as a shell string
+        cmd_str = """./runme -rs -q $(qos) -w $(walltime) --omp $(omp) -o "$(member_output_dir)" -p$(param_str)"""
+        
+        println("    Submitting member $member_id with command:")
+        println("      $cmd_str")
+        
+        # Execute via shell
+        output = read(`bash -c $cmd_str`, String)
+        
+        # Extract job ID from output
+        job_id_match = match(r"Submitted batch job (\d+)", output)
+        if job_id_match !== nothing
+            job_id = job_id_match.captures[1]
+            cd(original_dir)
+            return job_id, output_file
+        else
+            @warn "Could not extract job ID from runme output for member $member_id"
+            @warn "Output was: $output"
+            cd(original_dir)
+            error("Failed to extract job ID")
+        end
+        
+    catch e
+        cd(original_dir)
+        @error "Failed to submit job for member $member_id" exception=e
+        rethrow(e)
+    end
+end
+
+"""
+Submit CLIMBER-X jobs for one iteration using runme
+"""
+function submit_iteration_jobs_climber(params_i, iteration, work_dir, output_dir)
+    N_ensemble = size(params_i, 2)
+    job_trackers = JobTracker[]
     
-    # Create SLURM job script
-    script_content = """
-    #!/bin/bash
-    #SBATCH --job-name=climber_i$(iteration)_m$(member_id)
-    #SBATCH --qos=long
-    #SBATCH --time=200:00:00
-    #SBATCH --ntasks=1
-    #SBATCH --cpus-per-task=32
-    #SBATCH --mem=64G
-    #SBATCH --output=$(work_dir)/iter_$(iteration)/member_$(member_id)_%j.log
-    #SBATCH --error=$(work_dir)/iter_$(iteration)/member_$(member_id)_%j.err
+    println("\n  Submitting $N_ensemble CLIMBER-X jobs for iteration $iteration...")
+    println("  Using runme -rs to submit jobs")
+    println("  Expected runtime: ~20 hours per job (10000 years)")
     
-    echo "================================================================"
-    echo "CLIMBER-X EKI Calibration Job"
-    echo "================================================================"
-    echo "Iteration: $(iteration)"
-    echo "Member: $(member_id)"
-    echo "Parameter file: $(param_file)"
-    echo "Output directory: $(member_output_dir)"
-    echo "Start time: \$(date)"
-    echo "================================================================"
-    
-    # Change to CLIMBER-X directory
-    cd $(CLIMBER_X_DIR)
-    
-    # Read parameters for this member (line member_id + 1)
-    params=\$(sed -n '$((member_id + 1))p' $(param_file))
-    
-    # Parse the 6 parameters
-    read -r diff_dia_min drag_topo_fac slope_max diff_iso diff_gm diff_dia_max <<< \$params
-    
-    echo "Parameters for member $(member_id):"
-    echo "  ocn.diff_dia_min: \$diff_dia_min"
-    echo "  ocn.drag_topo_fac: \$drag_topo_fac"
-    echo "  ocn.slope_max: \$slope_max"
-    echo "  ocn.diff_iso: \$diff_iso"
-    echo "  ocn.diff_gm: \$diff_gm"
-    echo "  ocn.diff_dia_max: \$diff_dia_max"
-    echo ""
-    
-    # Run CLIMBER-X
-    echo "Starting CLIMBER-X simulation..."
-    ./runme -rs -q long -w 200:00:00 --omp 32 \\
-        -o $(member_output_dir) \\
-        -p ocn.diff_dia_min=\$diff_dia_min \\
-           ocn.drag_topo_fac=\$drag_topo_fac \\
-           ocn.slope_max=\$slope_max \\
-           ocn.diff_iso=\$diff_iso \\
-           ocn.diff_gm=\$diff_gm \\
-           ocn.diff_dia_max=\$diff_dia_max \\
-           ctl.nyears=$(CLIMBER_FIXED_PARAMS["ctl.nyears"]) \\
-           ctl.co2_const=$(CLIMBER_FIXED_PARAMS["ctl.co2_const"]) \\
-           ctl.fake_geo_const_file=$(CLIMBER_FIXED_PARAMS["ctl.fake_geo_const_file"]) \\
-           ctl.fake_ice_const_file=$(CLIMBER_FIXED_PARAMS["ctl.fake_ice_const_file"]) \\
-           ctl.restart_in_dir=$(CLIMBER_FIXED_PARAMS["ctl.restart_in_dir"]) \\
-           ocn.l_noise_fw=$(CLIMBER_FIXED_PARAMS["ocn.l_noise_fw"])
-    
-    exit_code=\$?
-    
-    echo ""
-    echo "================================================================"
-    echo "Job finished"
-    echo "End time: \$(date)"
-    echo "Exit code: \$exit_code"
-    
-    # Check if output file exists
-    if [ -f $(output_file) ] && [ \$exit_code -eq 0 ]; then
-        echo "SUCCESS: CLIMBER-X run completed"
-        echo "Output file: $(output_file)"
-        file_size=\$(du -h $(output_file) | cut -f1)
-        echo "File size: \$file_size"
-        echo "SUCCESS" > $(dirname(output_file))/member_$(member_id).status
-    else
-        echo "FAILED: CLIMBER-X run failed"
-        echo "Exit code: \$exit_code"
-        echo "FAILED" > $(dirname(output_file))/member_$(member_id).status
-        exit 1
-    fi
-    echo "================================================================"
-    """
-    
-    open(script_file, "w") do f
-        write(f, script_content)
+    # Check disk space
+    has_space, available_gb = check_disk_space(output_dir, min_gb_required=100, warn_gb=500)
+    if !has_space
+        error("Insufficient disk space")
     end
     
-    return script_file, output_file
+    # Submit jobs
+    for j in 1:N_ensemble
+        # Build parameter dictionary for this member
+        params_dict = Dict{String, Any}()
+        
+        # Add calibration parameters (with ocn. prefix)
+        for (idx, name) in enumerate(PARAM_NAMES)
+            params_dict["ocn.$(name)"] = params_i[idx, j]
+        end
+        
+        # Add fixed parameters
+        for (key, val) in CLIMBER_FIXED_PARAMS
+            params_dict[key] = val
+        end
+        
+        # Submit job
+        try
+            job_id, output_file = submit_climber_job_with_runme(
+                iteration, j, params_dict, output_dir, work_dir;
+                qos="standby",
+                walltime="20:00:00"
+            )
+            
+            tracker = JobTracker(
+                job_id,
+                j,
+                iteration,
+                :submitted,
+                now(),
+                nothing,
+                "",
+                output_file
+            )
+            push!(job_trackers, tracker)
+            
+            if j % 10 == 0 || j == N_ensemble
+                println("    Submitted $j/$N_ensemble jobs")
+            end
+            
+            sleep(2)  # Rate limiting
+            
+        catch e
+            @error "Failed to submit member $j" exception=e
+        end
+    end
+    
+    if length(job_trackers) < N_ensemble
+        @warn "Only submitted $(length(job_trackers))/$N_ensemble jobs successfully"
+    else
+        println("  ✓ All $N_ensemble jobs submitted!")
+    end
+    
+    return job_trackers
 end
 
 # ============================================
@@ -210,7 +197,7 @@ end
 """
 Validate CLIMBER-X output file
 """
-function validate_climber_output_file(output_file; min_size_bytes=1000000)
+function validate_climber_output_file(output_file; min_size_bytes=100000)
     if !isfile(output_file)
         return false, "File does not exist"
     end
@@ -240,59 +227,8 @@ function validate_climber_output_file(output_file; min_size_bytes=1000000)
 end
 
 # ============================================
-# JOB SUBMISSION AND COLLECTION
+# RESULT COLLECTION
 # ============================================
-
-"""
-Submit CLIMBER-X jobs for one iteration
-"""
-function submit_iteration_jobs_climber(params_i, iteration, work_dir, output_dir)
-    N_ensemble = size(params_i, 2)
-    job_trackers = JobTracker[]
-    
-    println("\n  Submitting $N_ensemble CLIMBER-X jobs for iteration $iteration...")
-    println("  Expected runtime: ~200 hours per job")
-    
-    # Check disk space
-    has_space, available_gb = check_disk_space(output_dir, min_gb_required=100, warn_gb=500)
-    if !has_space
-        error("Insufficient disk space")
-    end
-    
-    # Write ONE combined parameter file for this iteration
-    param_file = write_climber_params_for_iteration(params_i, iteration, work_dir)
-    
-    # Submit jobs - each reads its own line from the combined file
-    for j in 1:N_ensemble
-        script_file, output_file = create_climber_job_script(
-            iteration, j, param_file, output_dir, work_dir
-        )
-        
-        job_id = submit_job(script_file, max_retries=3)
-        
-        tracker = JobTracker(
-            job_id,
-            j,
-            iteration,
-            :submitted,
-            now(),
-            nothing,
-            param_file,
-            output_file
-        )
-        push!(job_trackers, tracker)
-        
-        if j % 10 == 0 || j == N_ensemble
-            println("    Submitted $j/$N_ensemble jobs")
-        end
-        
-        sleep(0.5)  # Rate limiting
-    end
-    
-    println("  ✓ All $N_ensemble jobs submitted!")
-    
-    return job_trackers
-end
 
 """
 Collect results from CLIMBER-X iteration using PCA model
@@ -308,15 +244,14 @@ function collect_climber_iteration_results(job_trackers, pca_model, y_obs; max_f
     
     for (j, tracker) in enumerate(job_trackers)
         if tracker.status == :completed
-            # Validate output file
             is_valid, msg = validate_climber_output_file(tracker.output_file)
             
             if is_valid
                 try
-                    # Process output and extract calibration statistics
                     calibration_stats, full_stats = process_climber_output(
                         tracker.output_file, pca_model,
-                        remove_spinup=true, spinup_fraction=0.02
+                        remove_spinup=true, spinup_fraction=0.02, do_min_spacing=500,
+                        do_crossing_value=2.0
                     )
                     
                     G_ensemble[:, j] = calibration_stats
@@ -354,6 +289,106 @@ function collect_climber_iteration_results(job_trackers, pca_model, y_obs; max_f
     return G_ensemble
 end
 
+"""
+Collect results from existing output files (for resuming)
+"""
+function collect_results_from_files(output_dir, iteration, N_ensemble, pca_model, y_obs; max_failures_allowed=5)
+    n_outputs = length(y_obs)
+    G_ensemble = zeros(n_outputs, N_ensemble)
+    n_failures = 0
+    
+    println("\n  Collecting results from existing files for iteration $iteration...")
+    
+    for j in 1:N_ensemble
+        output_file = joinpath(output_dir, "iter_$(iteration)", "member_$(j)", "ocn_ts.nc")
+        is_valid, msg = validate_climber_output_file(output_file)
+        
+        if is_valid
+            try
+                calibration_stats, _ = process_climber_output(
+                    output_file, pca_model,
+                    remove_spinup=true, spinup_fraction=0.02, do_min_spacing=500, 
+                    do_crossing_value = 2.0
+                )
+                G_ensemble[:, j] = calibration_stats
+                
+                if j % 10 == 0
+                    println("    Processed $j/$N_ensemble outputs")
+                end
+            catch e
+                @warn "Failed to process member $j: $e"
+                G_ensemble[:, j] .= NaN
+                n_failures += 1
+            end
+        else
+            @warn "Member $j output invalid: $msg"
+            G_ensemble[:, j] .= NaN
+            n_failures += 1
+        end
+    end
+    
+    if n_failures > max_failures_allowed
+        error("Too many failures: $n_failures/$N_ensemble")
+    end
+    
+    println("  ✓ Results collected: $(N_ensemble - n_failures) successful")
+    return G_ensemble
+end
+
+# ============================================
+# PCA MODEL MANAGEMENT
+# ============================================
+
+"""
+Load or fit PCA model
+"""
+function load_or_fit_pca(output_dir, ensemble_files, pca_components)
+    pca_file = joinpath(output_dir, "pca_model.jld2")
+    
+    if isfile(pca_file)
+        println("\n  Loading existing PCA model from $pca_file")
+        @load pca_file pca_model y_obs
+        println("  ✓ PCA model loaded")
+        println("  Target observations:")
+        println("    PCA components: $(round.(y_obs[1:5], digits=4))")
+        println("    Avg waiting time: $(round(y_obs[6], digits=1)) years")
+        println("    Avg stadial duration: $(round(y_obs[7], digits=1)) years")
+        return pca_model, y_obs
+    else
+        println("\n  Fitting new PCA model...")
+        
+        if length(ensemble_files) < 5
+            error("Cannot fit PCA with only $(length(ensemble_files)) successful runs. Need at least 5.")
+        end
+        
+        pca_model, stats_default = initialize_pca_model(
+            DEFAULT_RUN_OUTPUT,
+            ensemble_files;
+            n_components=pca_components,
+            remove_spinup=true,
+            spinup_fraction=0.02
+        )
+        
+        # Extract target observations from default run
+        default_calibration_stats, _ = process_climber_output(
+            DEFAULT_RUN_OUTPUT, pca_model,
+            remove_spinup=true, spinup_fraction=0.02,
+        )
+        y_obs = default_calibration_stats
+        
+        println("\n  Target observations (from default run):")
+        println("    PCA components: $(round.(y_obs[1:5], digits=4))")
+        println("    Avg waiting time: $(round(y_obs[6], digits=1)) years")
+        println("    Avg stadial duration: $(round(y_obs[7], digits=1)) years")
+        
+        # Save PCA model for future use
+        @save pca_file pca_model y_obs
+        println("  ✓ PCA model saved to $pca_file")
+        
+        return pca_model, y_obs
+    end
+end
+
 # ============================================
 # MAIN CALIBRATION FUNCTION
 # ============================================
@@ -361,11 +396,12 @@ end
 function run_climber_x_calibration(;
     N_iterations=10,
     N_ensemble=50,
-    output_dir="/p/tmp/karinako/eki_calibration",
-    work_dir="/p/tmp/karinako/eki_calibration",
+    output_dir="/p/tmp/karinako/eki_calibration/output",
+    work_dir="/p/tmp/karinako/eki_calibration/working",
     check_interval_minutes=30,
     max_wait_days=10,
-    pca_components=5)
+    pca_components=5,
+    )
     
     println("="^80)
     println("CLIMBER-X EKI CALIBRATION")
@@ -376,6 +412,22 @@ function run_climber_x_calibration(;
     println("Iterations: $N_iterations")
     println("Output directory: $output_dir")
     println("="^80)
+    
+    # Check that runme script exists
+    if !isfile(RUNME_SCRIPT)
+        error("CLIMBER-X runme script not found: $RUNME_SCRIPT")
+    end
+    println("  ✓ Found runme script: $RUNME_SCRIPT")
+    
+    # Check Python and runner module availability
+    println("\nChecking Python environment...")
+    try
+        run(`python3 -c "import sys; assert sys.version_info >= (3, 8), 'Python 3.8+ required'; import runner"`)
+        println("  ✓ Python 3.8+ and runner module available")
+    catch e
+        @error "Python 3.8+ or runner module not found"
+        rethrow(e)
+    end
     
     # Create directories
     mkpath(output_dir)
@@ -389,66 +441,125 @@ function run_climber_x_calibration(;
         error("Insufficient disk space")
     end
     
-    # Setup prior - TRUE uniform distributions
+    # Setup prior
     println("\nSetting up prior distributions...")
-    using Distributions  # for Uniform
-    
-    prior_dists = []
+
+    prior_dists = ParameterDistribution[]
     for name in PARAM_NAMES
         bounds = PRIOR_BOUNDS[name]
-        # Create uniform distribution in physical space
-        uniform_dist = Parameterized(Uniform(bounds[1], bounds[2]))
-        # No constraint needed - distribution is already in physical space
-        constraint = no_constraint()
-        push!(prior_dists, ParameterDistribution(uniform_dist, constraint, name))
+        
+        # Create uniform distribution using the built-in constructor
+        # For uniform distribution in constrained space, use Parameterized with Uniform
+        # and apply the bounded constraint
+        dist = Parameterized(Uniform(bounds[1], bounds[2]))
+        constraint = bounded(bounds[1], bounds[2])
+        
+        push!(prior_dists, 
+            ParameterDistribution(dist, constraint, name))
     end
     prior = combine_distributions(prior_dists)
+
+    println("Prior configured for $(length(PARAM_NAMES)) parameters with uniform distributions")
     
-    println("  ✓ Prior configured for $(length(PARAM_NAMES)) parameters")
+    # Check for existing checkpoint to resume from
+    start_iteration = 1
+    eksobj = nothing
+    pca_model = nothing
+    y_obs = nothing
+    param_history = nothing
     
-    # Process default run to get observations
-    println("\nProcessing default run for target observations...")
-    println("  Default run: $DEFAULT_RUN_OUTPUT")
+    # Find latest checkpoint
+    existing_checkpoints = filter(f -> startswith(f, "checkpoint_iter_") && endswith(f, ".jld2"), 
+                                  readdir(checkpoint_dir))
     
-    if !isfile(DEFAULT_RUN_OUTPUT)
-        error("Default run output not found: $DEFAULT_RUN_OUTPUT")
+    if !isempty(existing_checkpoints)
+        # Extract iteration numbers and find max
+        iter_nums = [parse(Int, match(r"checkpoint_iter_(\d+)\.jld2", f).captures[1]) 
+                     for f in existing_checkpoints]
+        latest_iter = maximum(iter_nums)
+        
+        if latest_iter > 0
+            println("\n  Found checkpoint at iteration $latest_iter")
+            print("  Resume from checkpoint? (y/n): ")
+            response = readline()
+            
+            if lowercase(strip(response)) == "y"
+                checkpoint_file = joinpath(checkpoint_dir, "checkpoint_iter_$(latest_iter).jld2")
+                @load checkpoint_file checkpoint_data
+                
+                eksobj = checkpoint_data["eksobj"]
+                prior = checkpoint_data["prior"]
+                param_history = checkpoint_data["param_history"]
+                y_obs = checkpoint_data["y_obs"]
+                
+                # Load PCA model
+                pca_file = joinpath(output_dir, "pca_model.jld2")
+                if isfile(pca_file)
+                    @load pca_file pca_model
+                end
+                
+                start_iteration = latest_iter + 1
+                println("  ✓ Resuming from iteration $start_iteration")
+            end
+        end
     end
     
-    # We'll fit PCA after first iteration, so for now just read the default stats
-    amoc_default, time_default = read_climber_amoc(DEFAULT_RUN_OUTPUT)
-    default_stats = compute_summary_stats(amoc_default; 
-                                         time_data=time_default,
-                                         remove_spinup=true,
-                                         spinup_fraction=0.02)
+    # If not resuming, initialize fresh
+    if isnothing(eksobj)
+        # Process default run to get observations
+        println("\nProcessing default run for target observations...")
+        println("  Default run: $DEFAULT_RUN_OUTPUT")
+        
+        if !isfile(DEFAULT_RUN_OUTPUT)
+            error("Default run output not found: $DEFAULT_RUN_OUTPUT")
+        end
+        
+        amoc_default, time_default = read_climber_amoc(DEFAULT_RUN_OUTPUT)
+        default_stats = compute_summary_stats(amoc_default; 
+                                             time_data=time_default,
+                                             remove_spinup=true,
+                                             spinup_fraction=0.02)
+        
+        println("  Default run statistics:")
+        println("    N stadials: $(default_stats["n_stadials"])")
+        println("    Avg stadial duration: $(round(default_stats["avg_stadial_duration"], digits=1)) years")
+        println("    N DO events: $(default_stats["n_do_events"])")
+        println("    Avg waiting time: $(round(default_stats["avg_waiting_time"], digits=1)) years")
+        
+        # Initialize EKI with placeholder observations (will update after PCA)
+        obs_noise_cov = Diagonal(OBS_UNCERTAINTIES.^2)
+        
+        println("\nInitializing EKI process...")
+        initial_ensemble = construct_initial_ensemble(prior, N_ensemble)
+        eks_process = Sampler(prior)
+        
+        y_obs_placeholder = zeros(7)
+        
+        eksobj = EnsembleKalmanProcess(
+            initial_ensemble,
+            y_obs_placeholder,
+            obs_noise_cov,
+            eks_process,
+            verbose=true
+        )
+        
+        param_history = zeros(length(PARAM_NAMES), N_iterations + 1, N_ensemble)
+        param_history[:, 1, :] = get_ϕ_final(prior, eksobj)
+        
+        metadata = Dict(
+            "start_time" => now(),
+            "N_iterations" => N_iterations,
+            "N_ensemble" => N_ensemble,
+            "param_names" => PARAM_NAMES,
+            "obs_uncertainties" => OBS_UNCERTAINTIES,
+            "default_run" => DEFAULT_RUN_OUTPUT,
+        )
+        
+        save_checkpoint(0, eksobj, prior, param_history, 
+                       y_obs_placeholder, obs_noise_cov, metadata, checkpoint_dir)
+    end
     
-    println("  Default run statistics:")
-    println("    N stadials: $(default_stats["n_stadials"])")
-    println("    Avg stadial duration: $(round(default_stats["avg_stadial_duration"], digits=1)) years")
-    println("    N DO events: $(default_stats["n_do_events"])")
-    println("    Avg waiting time: $(round(default_stats["avg_waiting_time"], digits=1)) years")
-    
-    # Observation noise covariance
     obs_noise_cov = Diagonal(OBS_UNCERTAINTIES.^2)
-    
-    # Initialize EKI
-    println("\nInitializing EKI process...")
-    initial_ensemble = construct_initial_ensemble(prior, N_ensemble)
-    eks_process = Sampler(prior)
-    
-    # We'll set y_obs after PCA is fit
-    # For now, create placeholder
-    y_obs_placeholder = zeros(7)
-    
-    eksobj = EnsembleKalmanProcess(
-        initial_ensemble,
-        y_obs_placeholder,  # Will update after PCA
-        obs_noise_cov,
-        eks_process,
-        verbose=true
-    )
-    
-    param_history = zeros(length(PARAM_NAMES), N_iterations + 1, N_ensemble)
-    param_history[:, 1, :] = get_ϕ_final(prior, eksobj)
     
     metadata = Dict(
         "start_time" => now(),
@@ -456,18 +567,11 @@ function run_climber_x_calibration(;
         "N_ensemble" => N_ensemble,
         "param_names" => PARAM_NAMES,
         "obs_uncertainties" => OBS_UNCERTAINTIES,
-        "default_run" => DEFAULT_RUN_OUTPUT
+        "default_run" => DEFAULT_RUN_OUTPUT,
     )
     
-    save_checkpoint(0, eksobj, prior, param_history, 
-                   y_obs_placeholder, obs_noise_cov, metadata, checkpoint_dir)
-    
-    # PCA model (will be fit after first iteration)
-    pca_model = nothing
-    y_obs = nothing
-    
     # Main iteration loop
-    for i in 1:N_iterations
+    for i in start_iteration:N_iterations
         iter_start_time = now()
         
         println("\n" * "="^80)
@@ -476,58 +580,66 @@ function run_climber_x_calibration(;
         
         params_i = get_ϕ_final(prior, eksobj)
         
-        # Submit jobs
-        job_trackers = submit_iteration_jobs_climber(
-            params_i, i, work_dir, output_dir
-        )
-        
-        save_job_trackers(job_trackers, i, output_dir)
-        
-        # Wait for completion
-        result = wait_for_iteration_completion(
-            job_trackers;
-            check_interval_minutes=check_interval_minutes,
-            max_wait_days=max_wait_days,
-            output_dir=output_dir
-        )
-        
-        if result == :timeout
-            error("Iteration $i timed out")
+        # Check if iteration already has completed outputs
+        iter_dir = joinpath(output_dir, "iter_$(i)")
+        all_outputs_exist = true
+        if isdir(iter_dir)
+            for j in 1:N_ensemble
+                output_file = joinpath(iter_dir, "member_$(j)", "ocn_ts.nc")
+                if !validate_climber_output_file(output_file)[1]
+                    all_outputs_exist = false
+                    break
+                end
+            end
+        else
+            all_outputs_exist = false
         end
         
-        # After first iteration: fit PCA and set observations
-        if i == 1 && isnothing(pca_model)
-            println("\n  Fitting PCA model from iteration 1 ensemble...")
+        if all_outputs_exist
+            println("  Found existing outputs for iteration $i, skipping job submission...")
             
+            # Create dummy job trackers with completed status
+            job_trackers = JobTracker[]
+            for j in 1:N_ensemble
+                output_file = joinpath(iter_dir, "member_$(j)", "ocn_ts.nc")
+                tracker = JobTracker("existing", j, i, :completed, now(), now(), "", output_file)
+                push!(job_trackers, tracker)
+            end
+        else
+            # Submit jobs
+            job_trackers = submit_iteration_jobs_climber(
+                params_i, i, work_dir, output_dir
+            )
+            
+            save_job_trackers(job_trackers, i, output_dir)
+            
+            # Wait for completion
+            result = wait_for_iteration_completion(
+                job_trackers;
+                check_interval_minutes=check_interval_minutes,
+                max_wait_days=max_wait_days,
+                output_dir=output_dir
+            )
+            
+            if result == :timeout
+                error("Iteration $i timed out")
+            end
+        end
+        
+        # After first iteration: load or fit PCA
+        if i == 1 && isnothing(pca_model)
             # Collect output files that completed successfully
             ensemble_files = [tracker.output_file for tracker in job_trackers 
                             if tracker.status == :completed && 
                                validate_climber_output_file(tracker.output_file)[1]]
             
-            pca_model, _ = initialize_pca_model(
-                DEFAULT_RUN_OUTPUT, 
-                ensemble_files;
-                n_components=pca_components,
-                remove_spinup=true,
-                spinup_fraction=0.02
-            )
+            # Load or fit PCA model
+            pca_model, y_obs = load_or_fit_pca(output_dir, ensemble_files, pca_components)
             
-            # Now we can extract target observations with PCA
-            default_calibration_stats, _ = process_climber_output(
-                DEFAULT_RUN_OUTPUT, pca_model,
-                remove_spinup=true, spinup_fraction=0.02
-            )
-            
-            y_obs = default_calibration_stats
-            
-            println("\n  Target observations (from default run):")
-            println("    PCA components: $(round.(y_obs[1:5], digits=4))")
-            println("    Avg waiting time: $(round(y_obs[6], digits=1)) years")
-            println("    Avg stadial duration: $(round(y_obs[7], digits=1)) years")
-            
-            # Update EKI with correct observations
+            # Recreate EKI with correct observations
+            eks_process = Sampler(prior)
             eksobj = EnsembleKalmanProcess(
-                get_ϕ(eksobj, 1),  # Use iteration 1 ensemble
+                get_ϕ(prior, eksobj, 1),  # FIXED: added prior argument
                 y_obs,
                 obs_noise_cov,
                 eks_process,
@@ -596,19 +708,12 @@ end
 # RUN THE CALIBRATION
 # ============================================
 
-println("\nStarting CLIMBER-X EKI calibration...")
-println("Note: First iteration will be used to fit PCA model")
-println("")
-
 eksobj, param_history, metadata, pca_model = run_climber_x_calibration(
-    N_iterations=10,
-    N_ensemble=50,
-    output_dir="/p/tmp/karinako/eki_calibration",
-    work_dir="/p/tmp/karinako/eki_calibration",
+    N_iterations=6,
+    N_ensemble=60,
+    output_dir="/p/tmp/karinako/eki_calibration_7000/output",
+    work_dir="/p/tmp/karinako/eki_calibration_7000/working",
     check_interval_minutes=30,
     max_wait_days=10,
-    pca_components=5
+    pca_components=5,
 )
-
-println("\n✓ Calibration completed successfully!")
-println("Results saved in: /p/tmp/karinako/eki_calibration/")
